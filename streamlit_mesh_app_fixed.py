@@ -16,6 +16,9 @@ import io
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
+import meshio
+import gmsh
+import re
 
 # Page configuration
 st.set_page_config(
@@ -49,6 +52,206 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
+
+def process_iges_file(uploaded_file, mesh_params, mesh_type="triangular"):
+    """Process uploaded .iges file and generate mesh"""
+    try:
+        # Save uploaded file temporarily with original extension
+        file_extension = '.iges' if uploaded_file.name.endswith('.iges') else '.igs'
+        iges_path = tempfile.mktemp(suffix=file_extension)
+        with open(iges_path, 'wb') as f:
+            f.write(uploaded_file.getvalue())
+        
+        # Verify file is readable and check if it's a valid IGES file
+        try:
+            with open(iges_path, 'rb') as f:
+                # Check if it's actually an IGES file
+                f.seek(0)
+                first_line = f.readline().decode('utf-8', errors='ignore').strip()
+                
+                if first_line.startswith('<!DOCTYPE') or first_line.startswith('<html'):
+                    return {
+                        'success': False,
+                        'error': f"Uploaded file appears to be HTML, not IGES. Please upload a valid IGES file."
+                    }
+                elif not (first_line.startswith('      ') or first_line.startswith('S')):
+                    return {
+                        'success': False,
+                        'error': f"File doesn't appear to be a valid IGES file. Please ensure you're uploading a proper IGES/IGS CAD file."
+                    }
+        except Exception as e:
+            return {
+                'success': False,
+                'error': f"Error reading uploaded file: {e}"
+            }
+        
+        # Create script to process IGES file
+        script_content = f'''
+import gmsh
+import meshio
+import json
+import tempfile
+import os
+import sys
+
+def process_iges():
+    try:
+        # Initialize Gmsh
+        gmsh.initialize()
+        gmsh.option.setNumber("General.Terminal", 0)
+        gmsh.option.setNumber("General.Verbosity", 0)
+        gmsh.model.add("iges_mesh")
+        
+        # Parameters
+        MIN_ELEM = {mesh_params['min_elem']}
+        MAX_ELEM = {mesh_params['max_elem']}
+        BASE_ELEM = {mesh_params['base_elem']}
+        MESH_TYPE = "{mesh_type}"
+        
+        # Import IGES file
+        iges_path = "{iges_path}"
+        if not os.path.exists(iges_path):
+            raise FileNotFoundError(f"IGES file not found: {{iges_path}}")
+        gmsh.open(iges_path)
+        
+        # Set mesh algorithm based on type
+        if MESH_TYPE == "quadrilateral":
+            gmsh.option.setNumber("Mesh.Algorithm", 8)
+            gmsh.option.setNumber("Mesh.RecombineAll", 1)
+            gmsh.option.setNumber("Mesh.SubdivisionAlgorithm", 1)
+        else:
+            gmsh.option.setNumber("Mesh.Algorithm", 6)
+            gmsh.option.setNumber("Mesh.RecombineAll", 0)
+        
+        # Set mesh size
+        gmsh.option.setNumber("Mesh.MeshSizeMin", MIN_ELEM)
+        gmsh.option.setNumber("Mesh.MeshSizeMax", MAX_ELEM)
+        
+        # Generate mesh
+        gmsh.model.geo.synchronize()
+        gmsh.model.mesh.generate(2)
+        
+        # Save and read mesh
+        tmpfile = tempfile.mktemp(suffix=".msh")
+        gmsh.write(tmpfile)
+        gmsh.finalize()
+        
+        mesh = meshio.read(tmpfile)
+        points = mesh.points
+        
+        # Extract elements
+        triangles = []
+        quads = []
+        
+        if "triangle" in mesh.cells_dict:
+            triangles = mesh.cells_dict["triangle"]
+        if "quad" in mesh.cells_dict:
+            quads = mesh.cells_dict["quad"]
+        
+        # Cleanup
+        os.remove(tmpfile)
+        
+        result = {{
+            'success': True,
+            'points': points.tolist(),
+            'triangles': triangles.tolist() if len(triangles) > 0 else [],
+            'quads': quads.tolist() if len(quads) > 0 else [],
+            'faces': [],  # IGES files don't have predefined faces
+            'num_points': len(points),
+            'num_triangles': len(triangles),
+            'num_quads': len(quads),
+            'mesh_type': MESH_TYPE,
+            'is_3d': True,
+            'source': 'iges'
+        }}
+        
+        print(json.dumps(result))
+        
+    except Exception as e:
+        result = {{
+            'success': False,
+            'error': str(e)
+        }}
+        print(json.dumps(result))
+
+if __name__ == "__main__":
+    process_iges()
+'''
+        
+        # Write script to temporary file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
+            f.write(script_content)
+            script_path = f.name
+        
+        # Run the script
+        result = subprocess.run(
+            ['python3', script_path],
+            capture_output=True,
+            text=True,
+            timeout=120  # Longer timeout for IGES processing
+        )
+        
+        # Show error information if needed
+        if result.returncode != 0 or not result.stdout.strip():
+            st.error(f"Mesh generation failed. Return code: {result.returncode}")
+            if result.stderr:
+                st.error(f"Error details: {result.stderr}")
+        
+        # Clean up script file only (keep IGES file until subprocess is done)
+        os.unlink(script_path)
+        
+        if result.returncode != 0:
+            return {
+                'success': False,
+                'error': f"IGES processing failed: {result.stderr}"
+            }
+        
+        # Parse result with better error handling
+        try:
+            stdout_text = result.stdout.strip()
+            if not stdout_text:
+                return {
+                    'success': False,
+                    'error': f"No output from IGES processing script. stderr: {result.stderr}"
+                }
+            
+            # Remove ANSI escape codes from stdout
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            clean_stdout = ansi_escape.sub('', stdout_text)
+            
+            # Find JSON part (look for the last occurrence of {)
+            json_start = clean_stdout.rfind('{')
+            if json_start == -1:
+                return {
+                    'success': False,
+                    'error': f"No JSON found in output. Clean stdout: {clean_stdout}"
+                }
+            
+            json_text = clean_stdout[json_start:]
+            result_data = json.loads(json_text)
+            
+            if result_data['success']:
+                result_data['points'] = np.array(result_data['points'])
+                result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
+                result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
+            
+            return result_data
+            
+        except json.JSONDecodeError as e:
+            return {
+                'success': False,
+                'error': f"Failed to parse JSON output: {e}. stdout: {result.stdout}, stderr: {result.stderr}"
+            }
+        finally:
+            # Clean up IGES file after processing
+            if 'iges_path' in locals() and os.path.exists(iges_path):
+                os.unlink(iges_path)
+        
+    except Exception as e:
+        return {
+            'success': False,
+            'error': str(e)
+        }
 
 def create_mesh_script(geometry_data, mesh_params, mesh_type="triangular", is_3d=False):
     """Create a temporary Python script for mesh generation"""
@@ -252,7 +455,7 @@ def create_mesh():
                     'points': points.tolist(),
                     'triangles': triangles.tolist() if len(triangles) > 0 else [],
                     'quads': quads.tolist() if len(quads) > 0 else [],
-                    'faces': faces,
+                    'faces': faces if 'faces' in locals() else [],
                     'num_points': len(points),
                     'num_triangles': len(triangles),
                     'num_quads': len(quads),
@@ -341,6 +544,7 @@ def create_mesh():
                 'points': points.tolist(),
                 'triangles': triangles.tolist() if len(triangles) > 0 else [],
                 'quads': quads.tolist() if len(quads) > 0 else [],
+                'faces': [],  # 2D meshes don't have faces
                 'outer_coords': outer_coords,
                 'holes': holes,
                 'num_points': len(points),
@@ -383,6 +587,12 @@ def create_mesh_from_geometry(geometry_data, title, mesh_params, mesh_type="tria
             timeout=60  # Increased timeout for 3D meshes
         )
         
+        # Show error information if needed
+        if result.returncode != 0 or not result.stdout.strip():
+            st.error(f"Mesh generation failed. Return code: {result.returncode}")
+            if result.stderr:
+                st.error(f"Error details: {result.stderr}")
+        
         # Clean up script file
         os.unlink(script_path)
         
@@ -392,23 +602,50 @@ def create_mesh_from_geometry(geometry_data, title, mesh_params, mesh_type="tria
                 'error': f"Script execution failed: {result.stderr}"
             }
         
-        # Parse JSON result
-        result_data = json.loads(result.stdout.strip())
-        
-        if result_data['success']:
-            # Convert points back to numpy array
-            result_data['points'] = np.array(result_data['points'])
+        # Parse JSON result with better error handling
+        try:
+            stdout_text = result.stdout.strip()
+            if not stdout_text:
+                return {
+                    'success': False,
+                    'error': f"No output from mesh generation script. stderr: {result.stderr}"
+                }
             
-            if is_3d:
-                # Handle 3D surface mesh data
-                result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
-                result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
-            else:
-                # Handle 2D mesh data
-                result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
-                result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
-        
-        return result_data
+            # Remove ANSI escape codes from stdout
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            clean_stdout = ansi_escape.sub('', stdout_text)
+            
+            # Find JSON part (look for the last occurrence of {)
+            json_start = clean_stdout.rfind('{')
+            if json_start == -1:
+                return {
+                    'success': False,
+                    'error': f"No JSON found in output. Clean stdout: {clean_stdout}"
+                }
+            
+            json_text = clean_stdout[json_start:]
+            result_data = json.loads(json_text)
+            
+            if result_data['success']:
+                # Convert points back to numpy array
+                result_data['points'] = np.array(result_data['points'])
+                
+                if is_3d:
+                    # Handle 3D surface mesh data
+                    result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
+                    result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
+                else:
+                    # Handle 2D mesh data
+                    result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
+                    result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
+            
+            return result_data
+            
+        except json.JSONDecodeError as e:
+            return {
+                'success': False,
+                'error': f"Failed to parse JSON output: {e}. stdout: {result.stdout}, stderr: {result.stderr}"
+            }
         
     except subprocess.TimeoutExpired:
         return {
@@ -530,6 +767,7 @@ def create_mesh():
             'points': points.tolist(),
             'triangles': triangles.tolist() if len(triangles) > 0 else [],
             'quads': quads.tolist() if len(quads) > 0 else [],
+            'faces': [],  # 2D WKT meshes don't have faces
             'outer_coords': outer_coords,
             'holes': holes,
             'num_points': len(points),
@@ -565,6 +803,12 @@ if __name__ == "__main__":
             timeout=30
         )
         
+        # Show error information if needed
+        if result.returncode != 0 or not result.stdout.strip():
+            st.error(f"Mesh generation failed. Return code: {result.returncode}")
+            if result.stderr:
+                st.error(f"Error details: {result.stderr}")
+        
         # Clean up script file
         os.unlink(script_path)
         
@@ -574,16 +818,43 @@ if __name__ == "__main__":
                 'error': f"Script execution failed: {result.stderr}"
             }
         
-        # Parse JSON result
-        result_data = json.loads(result.stdout.strip())
-        
-        if result_data['success']:
-            # Convert points back to numpy array
-            result_data['points'] = np.array(result_data['points'])
-            result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
-            result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
-        
-        return result_data
+        # Parse JSON result with better error handling
+        try:
+            stdout_text = result.stdout.strip()
+            if not stdout_text:
+                return {
+                    'success': False,
+                    'error': f"No output from WKT mesh generation script. stderr: {result.stderr}"
+                }
+            
+            # Remove ANSI escape codes from stdout
+            ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+            clean_stdout = ansi_escape.sub('', stdout_text)
+            
+            # Find JSON part (look for the last occurrence of {)
+            json_start = clean_stdout.rfind('{')
+            if json_start == -1:
+                return {
+                    'success': False,
+                    'error': f"No JSON found in output. Clean stdout: {clean_stdout}"
+                }
+            
+            json_text = clean_stdout[json_start:]
+            result_data = json.loads(json_text)
+            
+            if result_data['success']:
+                # Convert points back to numpy array
+                result_data['points'] = np.array(result_data['points'])
+                result_data['triangles'] = np.array(result_data['triangles']) if result_data['triangles'] else np.array([])
+                result_data['quads'] = np.array(result_data['quads']) if result_data['quads'] else np.array([])
+            
+            return result_data
+            
+        except json.JSONDecodeError as e:
+            return {
+                'success': False,
+                'error': f"Failed to parse JSON output: {e}. stdout: {result.stdout}, stderr: {result.stderr}"
+            }
         
     except subprocess.TimeoutExpired:
         return {
@@ -595,6 +866,106 @@ if __name__ == "__main__":
             'success': False,
             'error': str(e)
         }
+
+def generate_postscript_mesh(points, triangles, quads, title, mesh_type, is_3d=False):
+    """Generate PostScript representation of the mesh"""
+    try:
+        if is_3d:
+            # For 3D meshes, project to 2D for PostScript
+            # Use orthographic projection (remove Z coordinate)
+            points_2d = points[:, :2]
+        else:
+            points_2d = points
+        
+        # Create PostScript content
+        ps_content = f"""%!PS-Adobe-3.0 EPSF-3.0
+%%Creator: CAD to 2D/3D Mesh Generator
+%%Title: {title}
+%%BoundingBox: {points_2d[:, 0].min():.2f} {points_2d[:, 1].min():.2f} {points_2d[:, 0].max():.2f} {points_2d[:, 1].max():.2f}
+%%EndComments
+
+% Set up coordinate system
+{points_2d[:, 0].min():.2f} {points_2d[:, 1].min():.2f} translate
+1 1 scale
+
+% Define colors
+/TriangleColor {{0.7 0.7 0.7 setrgbcolor}} def
+/QuadColor {{0.8 0.8 0.8 setrgbcolor}} def
+/LineColor {{0 0 0 setrgbcolor}} def
+
+% Draw triangles
+gsave
+TriangleColor
+"""
+        
+        # Add triangles
+        if len(triangles) > 0:
+            for tri in triangles:
+                pts = points_2d[tri]
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} moveto\n"
+                ps_content += f"{pts[1, 0]:.2f} {pts[1, 1]:.2f} lineto\n"
+                ps_content += f"{pts[2, 0]:.2f} {pts[2, 1]:.2f} lineto\n"
+                ps_content += "closepath fill\n"
+        
+        ps_content += "grestore\n\n% Draw quads\n"
+        
+        # Add quads
+        if len(quads) > 0:
+            ps_content += "gsave\nQuadColor\n"
+            for quad in quads:
+                pts = points_2d[quad]
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} moveto\n"
+                ps_content += f"{pts[1, 0]:.2f} {pts[1, 1]:.2f} lineto\n"
+                ps_content += f"{pts[2, 0]:.2f} {pts[2, 1]:.2f} lineto\n"
+                ps_content += f"{pts[3, 0]:.2f} {pts[3, 1]:.2f} lineto\n"
+                ps_content += "closepath fill\n"
+            ps_content += "grestore\n\n"
+        
+        # Draw mesh lines
+        ps_content += "% Draw mesh lines\n"
+        ps_content += "gsave\n"
+        ps_content += "LineColor\n"
+        ps_content += "0.5 setlinewidth\n"
+        
+        # Triangle lines
+        if len(triangles) > 0:
+            for tri in triangles:
+                pts = points_2d[tri]
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} moveto\n"
+                ps_content += f"{pts[1, 0]:.2f} {pts[1, 1]:.2f} lineto\n"
+                ps_content += f"{pts[2, 0]:.2f} {pts[2, 1]:.2f} lineto\n"
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} lineto\n"
+                ps_content += "stroke\n"
+        
+        # Quad lines
+        if len(quads) > 0:
+            for quad in quads:
+                pts = points_2d[quad]
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} moveto\n"
+                ps_content += f"{pts[1, 0]:.2f} {pts[1, 1]:.2f} lineto\n"
+                ps_content += f"{pts[2, 0]:.2f} {pts[2, 1]:.2f} lineto\n"
+                ps_content += f"{pts[3, 0]:.2f} {pts[3, 1]:.2f} lineto\n"
+                ps_content += f"{pts[0, 0]:.2f} {pts[0, 1]:.2f} lineto\n"
+                ps_content += "stroke\n"
+        
+        ps_content += "grestore\n\n"
+        
+        # Add title
+        ps_content += f"""% Add title
+gsave
+/Times-Roman findfont 12 scalefont setfont
+0 0 0 setrgbcolor
+10 10 moveto
+({title}) show
+grestore
+
+showpage
+%%EOF"""
+        
+        return ps_content
+        
+    except Exception as e:
+        return f"%!PS-Adobe-3.0 EPSF-3.0\n%%Error: {str(e)}\n%%EOF"
 
 def plot_mesh_2d(points, triangles, quads, title, mesh_type, figsize=(10, 6)):
     """Create 2D mesh visualization"""
@@ -921,7 +1292,7 @@ PREDEFINED_GEOMETRIES = {
 def main():
     # Header
     st.markdown('<h1 class="main-header">🔺 CAD to 2D/3D Mesh Generator</h1>', unsafe_allow_html=True)
-    st.markdown("Generate high-quality 2D and 3D meshes from WKT geometries using Gmsh with interactive 3D visualization")
+    st.markdown("Generate high-quality 2D and 3D meshes from WKT geometries, IGES files, and predefined shapes using Gmsh with interactive 3D visualization and PostScript export")
     
     # Sidebar for controls
     with st.sidebar:
@@ -937,7 +1308,7 @@ def main():
         # Input method selection
         input_method = st.radio(
             "Choose input method:",
-            ["Predefined Geometry", "Upload WKT File", "Manual Coordinates"]
+            ["Predefined Geometry", "Upload WKT File", "Upload IGES File", "Manual Coordinates"]
         )
         
         # Mesh type selection
@@ -967,6 +1338,7 @@ def main():
         st.header("📐 Input Geometry")
         
         wkt_input = ""
+        geometry_data = None
         
         if input_method == "Predefined Geometry":
             # Filter geometries based on type
@@ -1077,6 +1449,23 @@ def main():
                 except Exception as e:
                     st.error(f"Error reading file: {e}")
         
+        elif input_method == "Upload IGES File":
+            uploaded_iges = st.file_uploader(
+                "Upload an IGES file:",
+                type=['iges', 'igs'],
+                help="Upload an IGES/IGS CAD file for mesh generation"
+            )
+            
+            if uploaded_iges is not None:
+                st.success("IGES file uploaded successfully!")
+                
+                # Show file info
+                with st.expander("IGES File Information"):
+                    st.write(f"**File name:** {uploaded_iges.name}")
+                    st.write(f"**File size:** {uploaded_iges.size} bytes")
+                    st.write("**File type:** IGES/IGS CAD format")
+                    st.info("IGES files will be processed as 3D geometries and meshed using Gmsh.")
+        
         elif input_method == "Manual Coordinates":
             st.subheader("Enter Coordinates Manually")
             
@@ -1140,11 +1529,24 @@ def main():
     with col2:
         st.header("🔺 Generated Mesh")
         
-        if geometry_data:
+        # Check if we have valid input data
+        has_input = False
+        if input_method == "Predefined Geometry" and geometry_data is not None:
+            has_input = True
+        elif input_method == "Upload WKT File" and wkt_input and wkt_input.strip():
+            has_input = True
+        elif input_method == "Upload IGES File" and 'uploaded_iges' in locals() and uploaded_iges is not None:
+            has_input = True
+        elif input_method == "Manual Coordinates" and wkt_input and wkt_input.strip():
+            has_input = True
+        
+        if has_input:
             if st.button("Generate Mesh", type="primary"):
-                is_3d = (geometry_type == "3D Polyhedral Surface")
+                is_3d = (geometry_type == "3D Polyhedral Surface" or input_method == "Upload IGES File")
                 with st.spinner("Generating mesh..."):
-                    if is_3d:
+                    if input_method == "Upload IGES File":
+                        result = process_iges_file(uploaded_iges, mesh_params, mesh_type)
+                    elif is_3d:
                         result = create_mesh_from_geometry(geometry_data, "Generated Mesh", mesh_params, mesh_type, is_3d)
                     else:
                         # For 2D geometries, we still need to handle WKT strings
@@ -1178,8 +1580,10 @@ def main():
                     
                     # Plot mesh
                     if is_3d:
+                        # Handle faces data - it might not exist for all mesh types
+                        faces = result.get('faces', [])
                         fig = plot_mesh_3d(result['points'], result['triangles'], result['quads'], 
-                                         result['faces'], "Generated 3D Surface Mesh", mesh_type)
+                                         faces, "Generated 3D Surface Mesh", mesh_type)
                         st.plotly_chart(fig, use_container_width=True)
                     else:
                         fig = plot_mesh_2d(result['points'], result['triangles'], result['quads'], 
@@ -1189,7 +1593,7 @@ def main():
                     # Download options
                     st.subheader("📥 Download Options")
                     
-                    col1_dl, col2_dl = st.columns(2)
+                    col1_dl, col2_dl, col3_dl = st.columns(3)
                     
                     if is_3d:
                         # For 3D plots, save as HTML
@@ -1215,13 +1619,30 @@ def main():
                                 mime="image/png"
                             )
                     
+                    # PostScript download for both 2D and 3D
+                    with col2_dl:
+                        ps_content = generate_postscript_mesh(
+                            result['points'], 
+                            result['triangles'], 
+                            result['quads'], 
+                            "Generated Mesh", 
+                            mesh_type, 
+                            is_3d
+                        )
+                        st.download_button(
+                            label="Download PostScript (.ps)",
+                            data=ps_content,
+                            file_name="mesh_visualization.ps",
+                            mime="application/postscript"
+                        )
+                    
                     # Save mesh data
                     if is_3d:
                         mesh_data = {
                             'points': result['points'].tolist(),
                             'triangles': result['triangles'].tolist() if len(result['triangles']) > 0 else [],
                             'quads': result['quads'].tolist() if len(result['quads']) > 0 else [],
-                            'faces': result['faces'],
+                            'faces': result.get('faces', []),
                             'num_points': result['num_points'],
                             'num_triangles': result['num_triangles'],
                             'num_quads': result['num_quads'],
@@ -1242,7 +1663,7 @@ def main():
                     
                     json_data = json.dumps(mesh_data, indent=2)
                     
-                    with col2_dl:
+                    with col3_dl:
                         st.download_button(
                             label="Download Mesh Data (JSON)",
                             data=json_data,
@@ -1256,17 +1677,21 @@ def main():
                         st.write(f"**Mesh Type:** {mesh_type.title()}")
                         
                         if is_3d:
-                            st.write(f"**Number of faces:** {len(result['faces'])}")
+                            faces = result.get('faces', [])
+                            st.write(f"**Number of faces:** {len(faces)}")
                             st.write(f"**Triangular elements:** {result['num_triangles']}")
                             st.write(f"**Quadrilateral elements:** {result['num_quads']}")
                             st.write(f"**Total surface elements:** {result['num_triangles'] + result['num_quads']}")
                             
-                            st.write("**Face details:**")
-                            for i, face in enumerate(result['faces']):
-                                st.write(f"  - Face {i+1}: {len(face)} points")
+                            if faces:
+                                st.write("**Face details:**")
+                                for i, face in enumerate(faces):
+                                    st.write(f"  - Face {i+1}: {len(face)} points")
                         else:
-                            st.write(f"**Outer boundary points:** {len(result['outer_coords'])}")
-                            st.write(f"**Number of holes:** {len(result['holes'])}")
+                            outer_coords = result.get('outer_coords', [])
+                            holes = result.get('holes', [])
+                            st.write(f"**Outer boundary points:** {len(outer_coords)}")
+                            st.write(f"**Number of holes:** {len(holes)}")
                             
                             if mesh_type == "quadrilateral":
                                 st.write(f"**Quadrilateral elements:** {result['num_quads']}")
@@ -1275,9 +1700,9 @@ def main():
                             else:
                                 st.write(f"**Triangular elements:** {result['num_triangles']}")
                             
-                            if result['holes']:
+                            if holes:
                                 st.write("**Hole details:**")
-                                for i, hole in enumerate(result['holes']):
+                                for i, hole in enumerate(holes):
                                     st.write(f"  - Hole {i+1}: {len(hole)} points")
                 
                 else:
@@ -1289,7 +1714,8 @@ def main():
     st.markdown("---")
     st.markdown("""
     <div style='text-align: center; color: #666;'>
-        <p>🔺 CAD to 2D Mesh Generator | Powered by Gmsh, Shapely, and Streamlit</p>
+        <p>🔺 CAD to 2D/3D Mesh Generator | Powered by Gmsh, Shapely, Meshio, and Streamlit</p>
+        <p>Supports WKT geometries, IGES files, and PostScript export</p>
     </div>
     """, unsafe_allow_html=True)
 
